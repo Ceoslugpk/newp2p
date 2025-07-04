@@ -104,36 +104,42 @@ get_user_input() {
     echo -e "${BLUE}=== P2P File Sharing Installation ===${NC}"
     echo ""
     
-    # Get domain name
-    while [ -z "$DOMAIN" ]; do
-        read -p "Enter your domain name (e.g., example.com): " DOMAIN
-        if [ -z "$DOMAIN" ]; then
-            warning "Domain name is required!"
+    # Check for command line arguments
+    if [ "$1" != "" ] && [ "$2" != "" ]; then
+        DOMAIN="$1"
+        EMAIL="$2"
+        log "Using command line arguments: Domain=$DOMAIN, Email=$EMAIL"
+    else
+        # Interactive mode
+        while [ -z "$DOMAIN" ]; do
+            read -p "Enter your domain name (e.g., example.com): " DOMAIN
+            if [ -z "$DOMAIN" ]; then
+                warning "Domain name is required!"
+            fi
+        done
+        
+        while [ -z "$EMAIL" ]; do
+            read -p "Enter your email for SSL certificate: " EMAIL
+            if [ -z "$EMAIL" ]; then
+                warning "Email is required for SSL certificate!"
+            fi
+        done
+        
+        # Confirm installation
+        echo ""
+        info "Installation Summary:"
+        info "Domain: $DOMAIN"
+        info "Email: $EMAIL"
+        info "Installation Directory: $APP_DIR"
+        info "Operating System: $OS $VER"
+        echo ""
+        
+        read -p "Continue with installation? (y/N): " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            info "Installation cancelled."
+            exit 0
         fi
-    done
-    
-    # Get email for SSL certificate
-    while [ -z "$EMAIL" ]; do
-        read -p "Enter your email for SSL certificate: " EMAIL
-        if [ -z "$EMAIL" ]; then
-            warning "Email is required for SSL certificate!"
-        fi
-    done
-    
-    # Confirm installation
-    echo ""
-    info "Installation Summary:"
-    info "Domain: $DOMAIN"
-    info "Email: $EMAIL"
-    info "Installation Directory: $APP_DIR"
-    info "Operating System: $OS $VER"
-    echo ""
-    
-    read -p "Continue with installation? (y/N): " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        info "Installation cancelled."
-        exit 0
     fi
 }
 
@@ -2208,7 +2214,6 @@ EOF
     log "Application files created successfully"
 }
 
-# Continue with the rest of the installation script...
 # Main installation function
 main() {
     log "Starting P2P File Sharing automatic installation..."
@@ -2216,7 +2221,7 @@ main() {
     fix_hostname
     check_root
     detect_os
-    get_user_input
+    get_user_input "$1" "$2"
     update_system
     install_docker
     install_nodejs
@@ -2250,5 +2255,5 @@ main() {
     echo ""
 }
 
-# Run main function
+# Run main function with arguments
 main "$@"
