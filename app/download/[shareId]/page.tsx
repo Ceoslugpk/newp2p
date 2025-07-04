@@ -44,15 +44,18 @@ export default function DownloadPage() {
       setIsLoading(true)
       setError(null)
 
-      // In a real implementation, this would query peers for file metadata
-      // For now, we'll simulate the discovery process
+      // Wait for network to be ready
       await new Promise((resolve) => setTimeout(resolve, 2000))
 
       // Check if this looks like a valid share ID
       if (shareId && shareId.length === 16 && /^[a-f0-9]+$/.test(shareId)) {
-        // This would normally come from peer responses
-        // For demo, we'll show that we're looking for the file
-        setError("File not found in network. The file may no longer be shared or peers are offline.")
+        // In a real P2P network, we would query peers for file metadata
+        // For now, show that we're looking for the file
+        if (peerCount === 0) {
+          setError("No peers available. Please ensure the file sharer is online and try again.")
+        } else {
+          setError("File not found in network. The file may no longer be shared or peers are offline.")
+        }
       } else {
         setError("Invalid share link format.")
       }

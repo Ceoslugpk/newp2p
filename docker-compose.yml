@@ -1,31 +1,55 @@
 version: '3.8'
 
 services:
-  p2p-file-share:
+  # Next.js Frontend Application
+  frontend:
     build: .
     ports:
       - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - NEXT_PUBLIC_SIGNALING_SERVER_URL=ws://signaling:8080
+    depends_on:
+      - signaling
+    networks:
+      - p2p-network
+    restart: unless-stopped
+
+  # WebSocket Signaling Server
+  signaling:
+    build:
+      context: .
+      dockerfile: Dockerfile.signaling
+    ports:
       - "8080:8080"
     environment:
       - NODE_ENV=production
-      - NEXT_PUBLIC_SIGNALING_SERVER_URL=ws://localhost:8080
+      - PORT=8080
+    networks:
+      - p2p-network
+    restart: unless-stopped
     volumes:
       - ./logs:/app/logs
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
 
+  # Nginx Reverse Proxy (Optional)
   nginx:
     image: nginx:alpine
     ports:
       - "80:80"
       - "443:443"
     volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf
-      - ./ssl:/etc/nginx/ssl
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
     depends_on:
-      - p2p-file-share
+      - frontend
+      - signaling
+    networks:
+      - p2p-network
     restart: unless-stopped
+
+networks:
+  p2p-network:
+    driver: bridge
+
+volumes:
+  logs:

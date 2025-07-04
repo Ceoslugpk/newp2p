@@ -79,115 +79,72 @@ export function useP2PNetwork() {
   const connectToSignalingServer = useCallback((): Promise<void> => {
     return new Promise((resolve, reject) => {
       try {
-        // Try localhost first, then fallback to demo mode
-        const wsUrls = [
-          "ws://localhost:8080",
-          // Add more signaling servers here if available
-        ]
+        // Use environment variable for signaling server URL or default to localhost
+        const signalingServerUrl = process.env.NEXT_PUBLIC_SIGNALING_SERVER_URL || "ws://localhost:8080"
 
-        let currentUrlIndex = 0
-        let connectionAttempted = false
+        console.log(`Connecting to signaling server: ${signalingServerUrl}`)
 
-        const tryConnection = () => {
-          if (currentUrlIndex >= wsUrls.length) {
-            // All servers failed, enable demo mode
-            console.log("All signaling servers failed, enabling demo mode")
-            enableDemoMode()
-            resolve()
-            return
+        signalingSocket.current = new WebSocket(signalingServerUrl)
+
+        const connectionTimeout = setTimeout(() => {
+          if (signalingSocket.current) {
+            signalingSocket.current.close()
+            reject(new Error("Connection timeout"))
           }
+        }, 10000) // 10 second timeout
 
-          const wsUrl = wsUrls[currentUrlIndex]
-          console.log(`Attempting connection to: ${wsUrl}`)
-          connectionAttempted = true
+        signalingSocket.current.onopen = () => {
+          clearTimeout(connectionTimeout)
+          console.log("✅ Connected to signaling server")
+          setIsConnected(true)
+          setConnectionType("direct")
 
-          try {
-            signalingSocket.current = new WebSocket(wsUrl)
+          signalingSocket.current?.send(
+            JSON.stringify({
+              type: "register",
+              peerId: localPeerId.current,
+              region: detectRegion(),
+            }),
+          )
 
-            const connectionTimeout = setTimeout(() => {
-              if (signalingSocket.current) {
-                signalingSocket.current.close()
-                currentUrlIndex++
-                tryConnection()
-              }
-            }, 3000) // Reduced timeout to 3 seconds
+          // Start peer discovery after successful connection
+          setTimeout(() => {
+            startPeerDiscovery()
+          }, 1000)
 
-            signalingSocket.current.onopen = () => {
-              clearTimeout(connectionTimeout)
-              console.log("✅ Connected to signaling server")
-              setIsConnected(true)
-              setConnectionType("direct")
-
-              signalingSocket.current?.send(
-                JSON.stringify({
-                  type: "register",
-                  peerId: localPeerId.current,
-                  region: detectRegion(),
-                }),
-              )
-
-              // Start peer discovery after successful connection
-              setTimeout(() => {
-                startPeerDiscovery()
-              }, 1000)
-
-              resolve()
-            }
-
-            signalingSocket.current.onmessage = (event: MessageEvent) => {
-              handleSignalingMessage(event)
-            }
-
-            signalingSocket.current.onerror = (error) => {
-              clearTimeout(connectionTimeout)
-              console.log(`Connection to ${wsUrl} failed, trying next...`)
-              currentUrlIndex++
-              tryConnection()
-            }
-
-            signalingSocket.current.onclose = (event) => {
-              clearTimeout(connectionTimeout)
-              console.log(`Connection to ${wsUrl} closed (${event.code})`)
-
-              // Only try reconnect if we were previously connected
-              if (isConnected) {
-                setIsConnected(false)
-                setTimeout(() => {
-                  console.log("Attempting to reconnect...")
-                  connectToSignalingServer().catch(() => {
-                    console.log("Reconnection failed, continuing in demo mode")
-                    enableDemoMode()
-                  })
-                }, 5000)
-              } else if (!connectionAttempted) {
-                currentUrlIndex++
-                tryConnection()
-              }
-            }
-          } catch (error) {
-            console.error(`Error creating WebSocket connection: ${error}`)
-            currentUrlIndex++
-            tryConnection()
-          }
+          resolve()
         }
 
-        // Start with demo mode immediately, then try real connection
-        enableDemoMode()
+        signalingSocket.current.onmessage = (event: MessageEvent) => {
+          handleSignalingMessage(event)
+        }
 
-        // Try real connection in background
-        setTimeout(() => {
-          tryConnection()
-        }, 1000)
+        signalingSocket.current.onerror = (error) => {
+          clearTimeout(connectionTimeout)
+          console.error("WebSocket connection error:", error)
+          reject(new Error("Failed to connect to signaling server"))
+        }
 
-        // Always resolve after enabling demo mode
-        resolve()
+        signalingSocket.current.onclose = (event) => {
+          clearTimeout(connectionTimeout)
+          console.log(`Connection closed (${event.code}: ${event.reason})`)
+          setIsConnected(false)
+          setConnectionType("disconnected")
+
+          // Attempt to reconnect after 5 seconds
+          setTimeout(() => {
+            console.log("Attempting to reconnect...")
+            connectToSignalingServer().catch((error) => {
+              console.error("Reconnection failed:", error)
+            })
+          }, 5000)
+        }
       } catch (error) {
-        console.error("Error in connectToSignalingServer:", error)
-        enableDemoMode()
-        resolve()
+        console.error("Error creating WebSocket connection:", error)
+        reject(error)
       }
     })
-  }, [isConnected])
+  }, [])
 
   useEffect(() => {
     localPeerId.current = generatePeerId()
@@ -201,7 +158,6 @@ export function useP2PNetwork() {
     try {
       console.log("🚀 Initializing P2P network...")
 
-      // Always start successfully, with fallback to demo mode
       await connectToSignalingServer()
 
       const statsInterval = setInterval(updateNetworkStats, 5000)
@@ -210,9 +166,9 @@ export function useP2PNetwork() {
 
       return () => clearInterval(statsInterval)
     } catch (error) {
-      console.error("Network initialization error:", error)
-      // Even if there's an error, enable demo mode
-      enableDemoMode()
+      console.error("Failed to initialize P2P network:", error)
+      setIsConnected(false)
+      setConnectionType("disconnected")
     }
   }, [connectToSignalingServer])
 
@@ -407,11 +363,6 @@ export function useP2PNetwork() {
   }, [])
 
   const setupPeerConnection = useCallback((peerConnection: RTCPeerConnection, peerId: string) => {
-    // Skip setup for demo mode connections
-    if (!peerConnection || typeof peerConnection.addEventListener !== "function") {
-      return
-    }
-
     peerConnection.onicecandidate = (event) => {
       if (event.candidate && signalingSocket.current?.readyState === WebSocket.OPEN) {
         signalingSocket.current.send(
@@ -432,21 +383,19 @@ export function useP2PNetwork() {
 
         if (peerConnection.connectionState === "connected") {
           // Determine if using TURN relay
-          if (typeof peerConnection.getStats === "function") {
-            peerConnection
-              .getStats()
-              .then((stats) => {
-                stats.forEach((report) => {
-                  if (report.type === "candidate-pair" && report.state === "succeeded") {
-                    const isRelay = report.localCandidateId && report.remoteCandidateId
-                    setConnectionType(isRelay ? "relay" : "direct")
-                  }
-                })
+          peerConnection
+            .getStats()
+            .then((stats) => {
+              stats.forEach((report) => {
+                if (report.type === "candidate-pair" && report.state === "succeeded") {
+                  const isRelay = report.localCandidateId && report.remoteCandidateId
+                  setConnectionType(isRelay ? "relay" : "direct")
+                }
               })
-              .catch(() => {
-                // Ignore stats errors in demo mode
-              })
-          }
+            })
+            .catch(() => {
+              // Ignore stats errors
+            })
 
           peer.lastSeen = Date.now()
           updatePeerState()
@@ -740,7 +689,6 @@ export function useP2PNetwork() {
 
   const cleanup = useCallback(() => {
     peersRef.current.forEach((peer) => {
-      // Only close real RTCPeerConnection objects
       if (peer.connection && typeof peer.connection.close === "function") {
         try {
           peer.connection.close()
@@ -760,46 +708,6 @@ export function useP2PNetwork() {
     setIsConnected(false)
     setPeerCount(0)
     setConnectedPeers([])
-  }, [])
-
-  const enableDemoMode = useCallback(() => {
-    console.log("🎭 Enabling demo mode")
-    setIsConnected(true)
-    setConnectionType("direct")
-
-    // Create demo peers with mock connections
-    const demoPeers = [
-      {
-        id: "demo-peer-1",
-        connection: {
-          close: () => console.log("Demo peer 1 connection closed"),
-          connectionState: "connected",
-          iceConnectionState: "connected",
-        } as any,
-        region: "us-east",
-        bandwidth: 1024 * 1024,
-        connectionType: "direct" as const,
-        lastSeen: Date.now(),
-      },
-      {
-        id: "demo-peer-2",
-        connection: {
-          close: () => console.log("Demo peer 2 connection closed"),
-          connectionState: "connected",
-          iceConnectionState: "connected",
-        } as any,
-        region: "eu-west",
-        bandwidth: 512 * 1024,
-        connectionType: "relay" as const,
-        lastSeen: Date.now(),
-      },
-    ]
-
-    demoPeers.forEach((peer) => {
-      peersRef.current.set(peer.id, peer)
-    })
-
-    updatePeerState()
   }, [])
 
   return {
