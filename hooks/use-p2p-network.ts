@@ -2,20 +2,14 @@
 
 import { useState, useEffect, useRef, useCallback } from "react"
 
-export interface PeerConnection {
+interface Peer {
   id: string
-  connection: RTCPeerConnection
-  dataChannel?: RTCDataChannel
+  connection: RTCPeerConnection | null
+  dataChannel: RTCDataChannel | null
   status: "connecting" | "connected" | "disconnected" | "failed"
 }
 
-export interface NetworkStatus {
-  signaling: "connecting" | "connected" | "disconnected" | "error"
-  peers: PeerConnection[]
-  isOnline: boolean
-}
-
-export interface FileTransfer {
+interface FileTransfer {
   id: string
   fileName: string
   fileSize: number
@@ -24,427 +18,398 @@ export interface FileTransfer {
   peerId: string
 }
 
-export function useP2PNetwork() {
-  const [networkStatus, setNetworkStatus] = useState<NetworkStatus>({
-    signaling: "disconnected",
-    peers: [],
-    isOnline: false,
-  })
+interface UseP2PNetworkReturn {
+  peers: Map<string, Peer>
+  isConnected: boolean
+  connectionStatus: string
+  fileTransfers: FileTransfer[]
+  shareFile: (file: File) => Promise<string>
+  requestFile: (shareId: string) => Promise<void>
+  sendMessage: (peerId: string, message: any) => void
+  connect: () => void
+  disconnect: () => void
+}
 
-  const [transfers, setTransfers] = useState<FileTransfer[]>([])
+const SIGNALING_SERVER_URL = process.env.NEXT_PUBLIC_SIGNALING_SERVER_URL || "wss://localhost:8080"
+
+// TURN servers configuration
+const TURN_SERVERS = [
+  {
+    urls: "stun:stun.l.google.com:19302",
+  },
+  {
+    urls: "stun:stun1.l.google.com:19302",
+  },
+]
+
+export function useP2PNetwork(): UseP2PNetworkReturn {
+  const [peers, setPeers] = useState<Map<string, Peer>>(new Map())
+  const [isConnected, setIsConnected] = useState(false)
+  const [connectionStatus, setConnectionStatus] = useState("Disconnected")
+  const [fileTransfers, setFileTransfers] = useState<FileTransfer[]>([])
+
   const wsRef = useRef<WebSocket | null>(null)
-  const peersRef = useRef<Map<string, PeerConnection>>(new Map())
-  const myPeerIdRef = useRef<string>("")
-  const currentRoomRef = useRef<string>("")
-  const pendingFilesRef = useRef<Map<string, File>>(new Map())
+  const localPeerIdRef = useRef<string>("")
+  const sharedFilesRef = useRef<Map<string, File>>(new Map())
 
-  // Generate unique peer ID
-  const generatePeerId = useCallback(() => {
-    return `peer_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
-  }, [])
-
-  // ICE servers configuration with TURN servers
-  const iceServers = [
-    { urls: "stun:stun.l.google.com:19302" },
-    { urls: "stun:stun1.l.google.com:19302" },
-    { urls: "stun:stun2.l.google.com:19302" },
-    {
-      urls: "turn:openrelay.metered.ca:80",
-      username: "openrelayproject",
-      credential: "openrelayproject",
-    },
-    {
-      urls: "turn:openrelay.metered.ca:443",
-      username: "openrelayproject",
-      credential: "openrelayproject",
-    },
-    {
-      urls: "turn:openrelay.metered.ca:443?transport=tcp",
-      username: "openrelayproject",
-      credential: "openrelayproject",
-    },
-  ]
-
-  // Create peer connection
-  const createPeerConnection = useCallback((peerId: string): RTCPeerConnection => {
+  // Create peer connection with TURN servers
+  const createPeerConnection = useCallback(() => {
     const pc = new RTCPeerConnection({
-      iceServers,
-      iceCandidatePoolSize: 10,
+      iceServers: TURN_SERVERS,
     })
 
     pc.oniceconnectionstatechange = () => {
-      console.log(`ICE connection state for ${peerId}:`, pc.iceConnectionState)
-
-      setNetworkStatus((prev) => ({
-        ...prev,
-        peers: prev.peers.map((peer) =>
-          peer.id === peerId
-            ? {
-                ...peer,
-                status:
-                  pc.iceConnectionState === "connected" || pc.iceConnectionState === "completed"
-                    ? "connected"
-                    : pc.iceConnectionState === "failed"
-                      ? "failed"
-                      : "connecting",
-              }
-            : peer,
-        ),
-      }))
+      console.log("ICE connection state:", pc.iceConnectionState)
     }
 
-    pc.onicecandidate = (event) => {
-      if (event.candidate && wsRef.current?.readyState === WebSocket.OPEN) {
-        wsRef.current.send(
-          JSON.stringify({
-            type: "ice-candidate",
-            targetPeerId: peerId,
-            candidate: event.candidate,
-          }),
-        )
-      }
+    pc.onconnectionstatechange = () => {
+      console.log("Connection state:", pc.connectionState)
     }
 
     return pc
   }, [])
 
-  // Handle incoming data channel
-  const handleDataChannel = useCallback((channel: RTCDataChannel, peerId: string) => {
-    let receivedData: ArrayBuffer[] = []
-    let expectedSize = 0
-    let fileName = ""
-    let transferId = ""
-
-    channel.onopen = () => {
-      console.log(`Data channel opened with ${peerId}`)
-    }
-
-    channel.onmessage = (event) => {
-      if (typeof event.data === "string") {
-        // Control message
-        const message = JSON.parse(event.data)
-
-        if (message.type === "file-info") {
-          fileName = message.fileName
-          expectedSize = message.fileSize
-          transferId = message.transferId
-          receivedData = []
-
-          setTransfers((prev) => [
-            ...prev,
-            {
-              id: transferId,
-              fileName,
-              fileSize: expectedSize,
-              progress: 0,
-              status: "transferring",
-              peerId,
-            },
-          ])
-        } else if (message.type === "file-end") {
-          // Reconstruct file
-          const blob = new Blob(receivedData)
-          const url = URL.createObjectURL(blob)
-
-          // Trigger download
-          const a = document.createElement("a")
-          a.href = url
-          a.download = fileName
-          document.body.appendChild(a)
-          a.click()
-          document.body.removeChild(a)
-          URL.revokeObjectURL(url)
-
-          setTransfers((prev) =>
-            prev.map((t) => (t.id === transferId ? { ...t, status: "completed", progress: 100 } : t)),
-          )
-        }
-      } else {
-        // File data chunk
-        receivedData.push(event.data)
-        const currentSize = receivedData.reduce((sum, chunk) => sum + chunk.byteLength, 0)
-        const progress = expectedSize > 0 ? (currentSize / expectedSize) * 100 : 0
-
-        setTransfers((prev) => prev.map((t) => (t.id === transferId ? { ...t, progress } : t)))
-      }
-    }
-
-    channel.onerror = (error) => {
-      console.error(`Data channel error with ${peerId}:`, error)
-      setTransfers((prev) => prev.map((t) => (t.peerId === peerId ? { ...t, status: "failed" } : t)))
-    }
-  }, [])
-
   // Connect to signaling server
-  const connectToSignaling = useCallback(() => {
-    const signalingUrl = process.env.NEXT_PUBLIC_SIGNALING_SERVER_URL || "ws://localhost:8080/ws"
-
+  const connect = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       return
     }
 
-    setNetworkStatus((prev) => ({ ...prev, signaling: "connecting" }))
+    setConnectionStatus("Connecting...")
 
     try {
-      wsRef.current = new WebSocket(signalingUrl)
+      const ws = new WebSocket(SIGNALING_SERVER_URL)
+      wsRef.current = ws
 
-      wsRef.current.onopen = () => {
+      ws.onopen = () => {
         console.log("Connected to signaling server")
-        setNetworkStatus((prev) => ({ ...prev, signaling: "connected", isOnline: true }))
-
-        // Register with server
-        myPeerIdRef.current = generatePeerId()
-        wsRef.current?.send(
-          JSON.stringify({
-            type: "register",
-            peerId: myPeerIdRef.current,
-          }),
-        )
+        setIsConnected(true)
+        setConnectionStatus("Connected")
       }
 
-      wsRef.current.onmessage = async (event) => {
-        const message = JSON.parse(event.data)
-
-        switch (message.type) {
-          case "welcome":
-            console.log("Received welcome from signaling server")
-            break
-
-          case "registered":
-            console.log("Registered with peer ID:", message.peerId)
-            break
-
-          case "peer-joined":
-            console.log("Peer joined:", message.peerId)
-            // Create offer for new peer
-            const pc = createPeerConnection(message.peerId)
-            peersRef.current.set(message.peerId, {
-              id: message.peerId,
-              connection: pc,
-              status: "connecting",
-            })
-
-            // Create data channel
-            const dataChannel = pc.createDataChannel("fileTransfer", {
-              ordered: true,
-            })
-
-            peersRef.current.get(message.peerId)!.dataChannel = dataChannel
-
-            // Set up data channel handlers
-            handleDataChannel(dataChannel, message.peerId)
-
-            // Create and send offer
-            const offer = await pc.createOffer()
-            await pc.setLocalDescription(offer)
-
-            wsRef.current?.send(
-              JSON.stringify({
-                type: "offer",
-                targetPeerId: message.peerId,
-                offer: offer,
-              }),
-            )
-
-            setNetworkStatus((prev) => ({
-              ...prev,
-              peers: [
-                ...prev.peers,
-                {
-                  id: message.peerId,
-                  connection: pc,
-                  dataChannel,
-                  status: "connecting",
-                },
-              ],
-            }))
-            break
-
-          case "offer":
-            console.log("Received offer from:", message.fromPeerId)
-            const answerPc = createPeerConnection(message.fromPeerId)
-            peersRef.current.set(message.fromPeerId, {
-              id: message.fromPeerId,
-              connection: answerPc,
-              status: "connecting",
-            })
-
-            // Handle incoming data channel
-            answerPc.ondatachannel = (event) => {
-              const channel = event.channel
-              peersRef.current.get(message.fromPeerId)!.dataChannel = channel
-              handleDataChannel(channel, message.fromPeerId)
-            }
-
-            await answerPc.setRemoteDescription(message.offer)
-            const answer = await answerPc.createAnswer()
-            await answerPc.setLocalDescription(answer)
-
-            wsRef.current?.send(
-              JSON.stringify({
-                type: "answer",
-                targetPeerId: message.fromPeerId,
-                answer: answer,
-              }),
-            )
-
-            setNetworkStatus((prev) => ({
-              ...prev,
-              peers: [
-                ...prev.peers,
-                {
-                  id: message.fromPeerId,
-                  connection: answerPc,
-                  status: "connecting",
-                },
-              ],
-            }))
-            break
-
-          case "answer":
-            console.log("Received answer from:", message.fromPeerId)
-            const peer = peersRef.current.get(message.fromPeerId)
-            if (peer) {
-              await peer.connection.setRemoteDescription(message.answer)
-            }
-            break
-
-          case "ice-candidate":
-            console.log("Received ICE candidate from:", message.fromPeerId)
-            const candidatePeer = peersRef.current.get(message.fromPeerId)
-            if (candidatePeer) {
-              await candidatePeer.connection.addIceCandidate(message.candidate)
-            }
-            break
-
-          case "file-request":
-            console.log("Received file request for:", message.shareId)
-            // Check if we have this file
-            const file = pendingFilesRef.current.get(message.shareId)
-            if (file) {
-              wsRef.current?.send(
-                JSON.stringify({
-                  type: "file-available",
-                  shareId: message.shareId,
-                  requesterId: message.requesterId,
-                  fileName: file.name,
-                  fileSize: file.size,
-                }),
-              )
-            }
-            break
-
-          case "file-available":
-            console.log("File available from:", message.providerId)
-            // Initiate connection to file provider
-            if (!peersRef.current.has(message.providerId)) {
-              const providerPc = createPeerConnection(message.providerId)
-              peersRef.current.set(message.providerId, {
-                id: message.providerId,
-                connection: providerPc,
-                status: "connecting",
-              })
-
-              // Create data channel for file transfer
-              const fileChannel = providerPc.createDataChannel("fileTransfer", {
-                ordered: true,
-              })
-
-              peersRef.current.get(message.providerId)!.dataChannel = fileChannel
-              handleDataChannel(fileChannel, message.providerId)
-
-              // Create offer
-              const fileOffer = await providerPc.createOffer()
-              await providerPc.setLocalDescription(fileOffer)
-
-              wsRef.current?.send(
-                JSON.stringify({
-                  type: "offer",
-                  targetPeerId: message.providerId,
-                  offer: fileOffer,
-                }),
-              )
-            }
-            break
-
-          case "peer-left":
-            console.log("Peer left:", message.peerId)
-            const leftPeer = peersRef.current.get(message.peerId)
-            if (leftPeer) {
-              leftPeer.connection.close()
-              peersRef.current.delete(message.peerId)
-            }
-
-            setNetworkStatus((prev) => ({
-              ...prev,
-              peers: prev.peers.filter((p) => p.id !== message.peerId),
-            }))
-            break
-
-          case "error":
-            console.error("Signaling error:", message.message)
-            break
+      ws.onmessage = async (event) => {
+        try {
+          const message = JSON.parse(event.data)
+          await handleSignalingMessage(message)
+        } catch (error) {
+          console.error("Error handling signaling message:", error)
         }
       }
 
-      wsRef.current.onclose = () => {
+      ws.onclose = () => {
         console.log("Disconnected from signaling server")
-        setNetworkStatus((prev) => ({
-          ...prev,
-          signaling: "disconnected",
-          isOnline: false,
-          peers: [],
-        }))
-
-        // Clean up peer connections
-        peersRef.current.forEach((peer) => {
-          peer.connection.close()
-        })
-        peersRef.current.clear()
+        setIsConnected(false)
+        setConnectionStatus("Disconnected")
 
         // Attempt to reconnect after 5 seconds
-        setTimeout(connectToSignaling, 5000)
+        setTimeout(() => {
+          if (wsRef.current?.readyState !== WebSocket.OPEN) {
+            connect()
+          }
+        }, 5000)
       }
 
-      wsRef.current.onerror = (error) => {
-        console.error("Signaling server error:", error)
-        setNetworkStatus((prev) => ({ ...prev, signaling: "error" }))
+      ws.onerror = (error) => {
+        console.error("WebSocket error:", error)
+        setConnectionStatus("Connection Error")
       }
     } catch (error) {
       console.error("Failed to connect to signaling server:", error)
-      setNetworkStatus((prev) => ({ ...prev, signaling: "error" }))
+      setConnectionStatus("Connection Failed")
     }
-  }, [generatePeerId, createPeerConnection, handleDataChannel])
+  }, [])
 
-  // Join a room
-  const joinRoom = useCallback((roomId: string) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      currentRoomRef.current = roomId
+  // Handle signaling messages
+  const handleSignalingMessage = useCallback(async (message: any) => {
+    switch (message.type) {
+      case "peer-id":
+        localPeerIdRef.current = message.peerId
+        console.log("Received peer ID:", message.peerId)
+        break
+
+      case "offer":
+        await handleOffer(message)
+        break
+
+      case "answer":
+        await handleAnswer(message)
+        break
+
+      case "ice-candidate":
+        await handleIceCandidate(message)
+        break
+
+      case "file-request":
+        handleFileRequest(message)
+        break
+
+      case "file-response":
+        handleFileResponse(message)
+        break
+
+      case "file-not-found":
+        console.log("File not found:", message.shareId)
+        break
+
+      default:
+        console.log("Unknown message type:", message.type)
+    }
+  }, [])
+
+  // Handle WebRTC offer
+  const handleOffer = useCallback(
+    async (message: any) => {
+      const pc = createPeerConnection()
+
+      // Set up data channel handlers
+      pc.ondatachannel = (event) => {
+        const dataChannel = event.channel
+        setupDataChannel(dataChannel, message.fromPeerId)
+      }
+
+      // Set up ICE candidate handling
+      pc.onicecandidate = (event) => {
+        if (event.candidate && wsRef.current) {
+          wsRef.current.send(
+            JSON.stringify({
+              type: "ice-candidate",
+              candidate: event.candidate,
+              targetPeerId: message.fromPeerId,
+            }),
+          )
+        }
+      }
+
+      try {
+        await pc.setRemoteDescription(message.offer)
+        const answer = await pc.createAnswer()
+        await pc.setLocalDescription(answer)
+
+        // Send answer
+        if (wsRef.current) {
+          wsRef.current.send(
+            JSON.stringify({
+              type: "answer",
+              answer: answer,
+              targetPeerId: message.fromPeerId,
+            }),
+          )
+        }
+
+        // Update peers
+        setPeers((prev) => {
+          const newPeers = new Map(prev)
+          newPeers.set(message.fromPeerId, {
+            id: message.fromPeerId,
+            connection: pc,
+            dataChannel: null,
+            status: "connecting",
+          })
+          return newPeers
+        })
+      } catch (error) {
+        console.error("Error handling offer:", error)
+      }
+    },
+    [createPeerConnection],
+  )
+
+  // Handle WebRTC answer
+  const handleAnswer = useCallback(
+    async (message: any) => {
+      const peer = peers.get(message.fromPeerId)
+      if (peer?.connection) {
+        try {
+          await peer.connection.setRemoteDescription(message.answer)
+        } catch (error) {
+          console.error("Error handling answer:", error)
+        }
+      }
+    },
+    [peers],
+  )
+
+  // Handle ICE candidate
+  const handleIceCandidate = useCallback(
+    async (message: any) => {
+      const peer = peers.get(message.fromPeerId)
+      if (peer?.connection) {
+        try {
+          await peer.connection.addIceCandidate(message.candidate)
+        } catch (error) {
+          console.error("Error adding ICE candidate:", error)
+        }
+      }
+    },
+    [peers],
+  )
+
+  // Set up data channel
+  const setupDataChannel = useCallback((dataChannel: RTCDataChannel, peerId: string) => {
+    dataChannel.onopen = () => {
+      console.log("Data channel opened with peer:", peerId)
+      setPeers((prev) => {
+        const newPeers = new Map(prev)
+        const peer = newPeers.get(peerId)
+        if (peer) {
+          peer.dataChannel = dataChannel
+          peer.status = "connected"
+        }
+        return newPeers
+      })
+    }
+
+    dataChannel.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data)
+        handleDataChannelMessage(data, peerId)
+      } catch (error) {
+        // Handle binary data (file chunks)
+        handleFileChunk(event.data, peerId)
+      }
+    }
+
+    dataChannel.onclose = () => {
+      console.log("Data channel closed with peer:", peerId)
+      setPeers((prev) => {
+        const newPeers = new Map(prev)
+        const peer = newPeers.get(peerId)
+        if (peer) {
+          peer.status = "disconnected"
+        }
+        return newPeers
+      })
+    }
+
+    dataChannel.onerror = (error) => {
+      console.error("Data channel error with peer:", peerId, error)
+    }
+  }, [])
+
+  // Handle data channel messages
+  const handleDataChannelMessage = useCallback((data: any, peerId: string) => {
+    switch (data.type) {
+      case "file-info":
+        // Handle file transfer initiation
+        console.log("Received file info from peer:", peerId, data)
+        break
+
+      case "file-chunk":
+        // Handle file chunk
+        handleFileChunk(data.chunk, peerId)
+        break
+
+      default:
+        console.log("Unknown data channel message:", data)
+    }
+  }, [])
+
+  // Handle file chunks
+  const handleFileChunk = useCallback((chunk: ArrayBuffer, peerId: string) => {
+    // Implementation for handling file chunks
+    console.log("Received file chunk from peer:", peerId, chunk.byteLength, "bytes")
+  }, [])
+
+  // Handle file request
+  const handleFileRequest = useCallback((message: any) => {
+    const file = sharedFilesRef.current.get(message.shareId)
+
+    if (file && wsRef.current) {
+      // Send file response
       wsRef.current.send(
         JSON.stringify({
-          type: "join-room",
-          roomId: roomId,
+          type: "file-response",
+          shareId: message.shareId,
+          available: true,
+          requesterPeerId: message.requesterPeerId,
+          fileInfo: {
+            name: file.name,
+            size: file.size,
+            type: file.type,
+          },
         }),
       )
     }
   }, [])
 
-  // Share files
-  const shareFiles = useCallback((files: File[]): string[] => {
-    const shareIds: string[] = []
-
-    files.forEach((file) => {
-      const shareId = `share_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
-      pendingFilesRef.current.set(shareId, file)
-      shareIds.push(shareId)
-    })
-
-    return shareIds
+  // Handle file response
+  const handleFileResponse = useCallback(async (message: any) => {
+    if (message.available) {
+      // Initiate P2P connection with file provider
+      await initiateConnection(message.providerPeerId)
+    }
   }, [])
 
-  // Request file download
-  const requestFile = useCallback((shareId: string) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
+  // Initiate P2P connection
+  const initiateConnection = useCallback(
+    async (targetPeerId: string) => {
+      const pc = createPeerConnection()
+
+      // Create data channel
+      const dataChannel = pc.createDataChannel("fileTransfer", {
+        ordered: true,
+      })
+
+      setupDataChannel(dataChannel, targetPeerId)
+
+      // Set up ICE candidate handling
+      pc.onicecandidate = (event) => {
+        if (event.candidate && wsRef.current) {
+          wsRef.current.send(
+            JSON.stringify({
+              type: "ice-candidate",
+              candidate: event.candidate,
+              targetPeerId: targetPeerId,
+            }),
+          )
+        }
+      }
+
+      try {
+        const offer = await pc.createOffer()
+        await pc.setLocalDescription(offer)
+
+        // Send offer
+        if (wsRef.current) {
+          wsRef.current.send(
+            JSON.stringify({
+              type: "offer",
+              offer: offer,
+              targetPeerId: targetPeerId,
+            }),
+          )
+        }
+
+        // Update peers
+        setPeers((prev) => {
+          const newPeers = new Map(prev)
+          newPeers.set(targetPeerId, {
+            id: targetPeerId,
+            connection: pc,
+            dataChannel: dataChannel,
+            status: "connecting",
+          })
+          return newPeers
+        })
+      } catch (error) {
+        console.error("Error initiating connection:", error)
+      }
+    },
+    [createPeerConnection, setupDataChannel],
+  )
+
+  // Share a file
+  const shareFile = useCallback(async (file: File): Promise<string> => {
+    const shareId = Math.random().toString(36).substr(2, 9)
+    sharedFilesRef.current.set(shareId, file)
+
+    console.log("File shared with ID:", shareId)
+    return shareId
+  }, [])
+
+  // Request a file
+  const requestFile = useCallback(async (shareId: string) => {
+    if (wsRef.current) {
       wsRef.current.send(
         JSON.stringify({
           type: "file-request",
@@ -454,88 +419,52 @@ export function useP2PNetwork() {
     }
   }, [])
 
-  // Send file to peer
-  const sendFileToPeer = useCallback(async (peerId: string, shareId: string) => {
-    const peer = peersRef.current.get(peerId)
-    const file = pendingFilesRef.current.get(shareId)
-
-    if (!peer?.dataChannel || !file || peer.dataChannel.readyState !== "open") {
-      console.error("Cannot send file: peer not connected or file not found")
-      return
-    }
-
-    const transferId = `transfer_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
-
-    // Send file info
-    peer.dataChannel.send(
-      JSON.stringify({
-        type: "file-info",
-        fileName: file.name,
-        fileSize: file.size,
-        transferId: transferId,
-      }),
-    )
-
-    // Send file in chunks
-    const chunkSize = 16384 // 16KB chunks
-    const reader = new FileReader()
-    let offset = 0
-
-    const sendChunk = () => {
-      const slice = file.slice(offset, offset + chunkSize)
-      reader.readAsArrayBuffer(slice)
-    }
-
-    reader.onload = (event) => {
-      if (event.target?.result && peer.dataChannel?.readyState === "open") {
-        peer.dataChannel.send(event.target.result as ArrayBuffer)
-        offset += chunkSize
-
-        if (offset < file.size) {
-          sendChunk()
-        } else {
-          // Send end marker
-          peer.dataChannel.send(
-            JSON.stringify({
-              type: "file-end",
-              transferId: transferId,
-            }),
-          )
-        }
+  // Send message to peer
+  const sendMessage = useCallback(
+    (peerId: string, message: any) => {
+      const peer = peers.get(peerId)
+      if (peer?.dataChannel?.readyState === "open") {
+        peer.dataChannel.send(JSON.stringify(message))
       }
-    }
+    },
+    [peers],
+  )
 
-    sendChunk()
-  }, [])
+  // Disconnect from network
+  const disconnect = useCallback(() => {
+    // Close all peer connections
+    peers.forEach((peer) => {
+      peer.connection?.close()
+    })
 
-  // Initialize connection on mount
+    // Close WebSocket connection
+    wsRef.current?.close()
+
+    // Reset state
+    setPeers(new Map())
+    setIsConnected(false)
+    setConnectionStatus("Disconnected")
+    sharedFilesRef.current.clear()
+  }, [peers])
+
+  // Auto-connect on mount
   useEffect(() => {
-    connectToSignaling()
-
-    // Join default room
-    const defaultRoom = "global"
-    setTimeout(() => joinRoom(defaultRoom), 1000)
+    connect()
 
     return () => {
-      // Cleanup on unmount
-      if (wsRef.current) {
-        wsRef.current.close()
-      }
-
-      peersRef.current.forEach((peer) => {
-        peer.connection.close()
-      })
-      peersRef.current.clear()
+      disconnect()
     }
-  }, [connectToSignaling, joinRoom])
+  }, [connect, disconnect])
 
   return {
-    networkStatus,
-    transfers,
-    shareFiles,
+    peers,
+    isConnected,
+    connectionStatus,
+    fileTransfers,
+    shareFile,
     requestFile,
-    sendFileToPeer,
-    joinRoom,
-    myPeerId: myPeerIdRef.current,
+    sendMessage,
+    connect,
+    disconnect,
   }
 }

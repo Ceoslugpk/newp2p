@@ -1,9 +1,9 @@
 "use client"
 
-import { useEffect, useState } from "react"
+import { useState, useEffect } from "react"
 import { useParams } from "next/navigation"
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Progress } from "@/components/ui/progress"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Download, AlertCircle, CheckCircle, Loader2 } from "lucide-react"
@@ -12,72 +12,58 @@ import { useP2PNetwork } from "@/hooks/use-p2p-network"
 interface FileInfo {
   name: string
   size: number
-  shareId: string
+  type: string
 }
 
 export default function DownloadPage() {
   const params = useParams()
   const shareId = params.shareId as string
-  const { networkStatus, transfers, requestFile } = useP2PNetwork()
+
   const [fileInfo, setFileInfo] = useState<FileInfo | null>(null)
+  const [downloadProgress, setDownloadProgress] = useState(0)
   const [downloadStatus, setDownloadStatus] = useState<
-    "idle" | "searching" | "found" | "downloading" | "completed" | "failed"
+    "idle" | "searching" | "connecting" | "downloading" | "completed" | "error"
   >("idle")
-  const [error, setError] = useState<string | null>(null)
+  const [errorMessage, setErrorMessage] = useState("")
+  const [downloadedFile, setDownloadedFile] = useState<Blob | null>(null)
 
-  // Find active transfer for this share
-  const activeTransfer = transfers.find((t) => t.id.includes(shareId))
+  const { isConnected, connectionStatus, requestFile, peers } = useP2PNetwork()
 
+  // Start file request when connected
   useEffect(() => {
-    if (shareId && networkStatus.isOnline) {
+    if (isConnected && shareId && downloadStatus === "idle") {
+      handleDownload()
+    }
+  }, [isConnected, shareId, downloadStatus])
+
+  const handleDownload = async () => {
+    if (!shareId) {
+      setErrorMessage("Invalid share ID")
+      setDownloadStatus("error")
+      return
+    }
+
+    try {
       setDownloadStatus("searching")
-      setError(null)
+      setErrorMessage("")
 
-      // Request the file from the network
-      requestFile(shareId)
+      // Request file from network
+      await requestFile(shareId)
 
-      // Set timeout for file discovery
-      const timeout = setTimeout(() => {
+      // Set timeout for file search
+      const searchTimeout = setTimeout(() => {
         if (downloadStatus === "searching") {
-          setDownloadStatus("failed")
-          setError("File not found in the network. The sharing peer may be offline.")
+          setErrorMessage("File not found or no peers available")
+          setDownloadStatus("error")
         }
       }, 30000) // 30 second timeout
 
-      return () => clearTimeout(timeout)
-    }
-  }, [shareId, networkStatus.isOnline, requestFile])
-
-  // Update status based on transfer progress
-  useEffect(() => {
-    if (activeTransfer) {
-      switch (activeTransfer.status) {
-        case "pending":
-          setDownloadStatus("found")
-          setFileInfo({
-            name: activeTransfer.fileName,
-            size: activeTransfer.fileSize,
-            shareId: shareId,
-          })
-          break
-        case "transferring":
-          setDownloadStatus("downloading")
-          break
-        case "completed":
-          setDownloadStatus("completed")
-          break
-        case "failed":
-          setDownloadStatus("failed")
-          setError("File transfer failed. Please try again.")
-          break
-      }
-    }
-  }, [activeTransfer, shareId])
-
-  const handleDownload = () => {
-    if (fileInfo) {
-      requestFile(shareId)
-      setDownloadStatus("downloading")
+      // Clear timeout if we find the file
+      return () => clearTimeout(searchTimeout)
+    } catch (error) {
+      console.error("Download error:", error)
+      setErrorMessage("Failed to request file")
+      setDownloadStatus("error")
     }
   }
 
@@ -89,168 +75,171 @@ export default function DownloadPage() {
     return Number.parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i]
   }
 
-  const getStatusIcon = () => {
-    switch (downloadStatus) {
-      case "searching":
-        return <Loader2 className="h-6 w-6 animate-spin text-blue-500" />
-      case "found":
-        return <Download className="h-6 w-6 text-green-500" />
-      case "downloading":
-        return <Loader2 className="h-6 w-6 animate-spin text-blue-500" />
-      case "completed":
-        return <CheckCircle className="h-6 w-6 text-green-500" />
-      case "failed":
-        return <AlertCircle className="h-6 w-6 text-red-500" />
-      default:
-        return <Download className="h-6 w-6 text-gray-500" />
+  const getFileIcon = (fileType: string) => {
+    if (fileType.startsWith("image/")) return "🖼️"
+    if (fileType.startsWith("video/")) return "🎥"
+    if (fileType.startsWith("audio/")) return "🎵"
+    if (fileType.includes("pdf")) return "📄"
+    if (fileType.includes("zip") || fileType.includes("rar")) return "📦"
+    return "📄"
+  }
+
+  const downloadFile = () => {
+    if (downloadedFile && fileInfo) {
+      const url = URL.createObjectURL(downloadedFile)
+      const a = document.createElement("a")
+      a.href = url
+      a.download = fileInfo.name
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      URL.revokeObjectURL(url)
     }
   }
 
   const getStatusMessage = () => {
     switch (downloadStatus) {
       case "idle":
-        return "Connecting to P2P network..."
+        return "Initializing..."
       case "searching":
-        return "Searching for file in the network..."
-      case "found":
-        return "File found! Ready to download."
+        return "Searching for file in P2P network..."
+      case "connecting":
+        return "Connecting to peer..."
       case "downloading":
-        return "Downloading file via P2P..."
+        return "Downloading file..."
       case "completed":
-        return "Download completed successfully!"
-      case "failed":
-        return "Download failed."
+        return "Download completed!"
+      case "error":
+        return errorMessage || "An error occurred"
       default:
         return "Unknown status"
     }
   }
 
-  if (!networkStatus.isOnline) {
-    return (
-      <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 flex items-center justify-center p-4">
-        <Card className="w-full max-w-md">
-          <CardHeader className="text-center">
-            <CardTitle className="flex items-center justify-center gap-2">
-              <AlertCircle className="h-6 w-6 text-red-500" />
-              Connection Error
-            </CardTitle>
-            <CardDescription>Unable to connect to the P2P network</CardDescription>
-          </CardHeader>
-          <CardContent>
-            <Alert>
-              <AlertCircle className="h-4 w-4" />
-              <AlertDescription>
-                Please check your internet connection and try again. The signaling server may be temporarily
-                unavailable.
-              </AlertDescription>
-            </Alert>
-          </CardContent>
-        </Card>
-      </div>
-    )
+  const getStatusIcon = () => {
+    switch (downloadStatus) {
+      case "idle":
+      case "searching":
+      case "connecting":
+      case "downloading":
+        return <Loader2 className="h-4 w-4 animate-spin" />
+      case "completed":
+        return <CheckCircle className="h-4 w-4 text-green-500" />
+      case "error":
+        return <AlertCircle className="h-4 w-4 text-red-500" />
+      default:
+        return null
+    }
   }
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 flex items-center justify-center p-4">
-      <Card className="w-full max-w-md">
-        <CardHeader className="text-center">
-          <CardTitle className="flex items-center justify-center gap-2">
-            {getStatusIcon()}
-            P2P File Download
-          </CardTitle>
-          <CardDescription>Share ID: {shareId}</CardDescription>
-        </CardHeader>
+    <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-4">
+      <div className="max-w-2xl mx-auto pt-20">
+        <Card className="shadow-lg">
+          <CardHeader className="text-center">
+            <CardTitle className="text-2xl font-bold text-gray-900">P2P File Download</CardTitle>
+            <CardDescription>
+              Share ID: <code className="bg-gray-100 px-2 py-1 rounded text-sm">{shareId}</code>
+            </CardDescription>
+          </CardHeader>
 
-        <CardContent className="space-y-4">
-          {/* Network Status */}
-          <div className="flex items-center justify-between text-sm">
-            <span>Network Status:</span>
-            <span
-              className={`font-medium ${networkStatus.signaling === "connected" ? "text-green-600" : "text-red-600"}`}
-            >
-              {networkStatus.signaling === "connected" ? "Connected" : "Disconnected"}
-            </span>
-          </div>
+          <CardContent className="space-y-6">
+            {/* Connection Status */}
+            <Alert>
+              <AlertCircle className="h-4 w-4" />
+              <AlertDescription>
+                Network Status: {connectionStatus} | Connected Peers: {peers.size}
+              </AlertDescription>
+            </Alert>
 
-          <div className="flex items-center justify-between text-sm">
-            <span>Connected Peers:</span>
-            <span className="font-medium">{networkStatus.peers.length}</span>
-          </div>
-
-          {/* File Information */}
-          {fileInfo && (
-            <div className="border rounded-lg p-4 bg-gray-50">
-              <h3 className="font-medium text-gray-900 mb-2">File Details</h3>
-              <div className="space-y-1 text-sm text-gray-600">
-                <div className="flex justify-between">
-                  <span>Name:</span>
-                  <span className="font-medium">{fileInfo.name}</span>
+            {/* File Information */}
+            {fileInfo && (
+              <div className="bg-gray-50 rounded-lg p-4">
+                <div className="flex items-center space-x-3">
+                  <div className="text-3xl">{getFileIcon(fileInfo.type)}</div>
+                  <div className="flex-1">
+                    <h3 className="font-semibold text-gray-900">{fileInfo.name}</h3>
+                    <p className="text-sm text-gray-600">
+                      {formatFileSize(fileInfo.size)} • {fileInfo.type}
+                    </p>
+                  </div>
                 </div>
-                <div className="flex justify-between">
-                  <span>Size:</span>
-                  <span className="font-medium">{formatFileSize(fileInfo.size)}</span>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* Status Message */}
-          <div className="text-center">
-            <p className="text-sm text-gray-600 mb-4">{getStatusMessage()}</p>
-
-            {/* Progress Bar */}
-            {activeTransfer && downloadStatus === "downloading" && (
-              <div className="space-y-2">
-                <Progress value={activeTransfer.progress} className="w-full" />
-                <p className="text-xs text-gray-500">{Math.round(activeTransfer.progress)}% completed</p>
               </div>
             )}
-          </div>
 
-          {/* Action Button */}
-          {downloadStatus === "found" && (
-            <Button onClick={handleDownload} className="w-full" size="lg">
-              <Download className="h-4 w-4 mr-2" />
-              Download via P2P
-            </Button>
-          )}
+            {/* Download Status */}
+            <div className="space-y-3">
+              <div className="flex items-center space-x-2">
+                {getStatusIcon()}
+                <span className="text-sm font-medium text-gray-700">{getStatusMessage()}</span>
+              </div>
 
-          {downloadStatus === "searching" && (
-            <Button disabled className="w-full" size="lg">
-              <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-              Searching for file...
-            </Button>
-          )}
+              {/* Progress Bar */}
+              {(downloadStatus === "downloading" || downloadStatus === "completed") && (
+                <div className="space-y-2">
+                  <Progress value={downloadProgress} className="w-full" />
+                  <p className="text-xs text-gray-600 text-center">{downloadProgress}% completed</p>
+                </div>
+              )}
+            </div>
 
-          {downloadStatus === "downloading" && (
-            <Button disabled className="w-full" size="lg">
-              <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-              Downloading...
-            </Button>
-          )}
+            {/* Error Message */}
+            {downloadStatus === "error" && (
+              <Alert variant="destructive">
+                <AlertCircle className="h-4 w-4" />
+                <AlertDescription>{errorMessage}</AlertDescription>
+              </Alert>
+            )}
 
-          {downloadStatus === "completed" && (
-            <Button disabled className="w-full" size="lg">
-              <CheckCircle className="h-4 w-4 mr-2" />
-              Download Completed
-            </Button>
-          )}
+            {/* Action Buttons */}
+            <div className="flex space-x-3">
+              {downloadStatus === "completed" && downloadedFile ? (
+                <Button onClick={downloadFile} className="flex-1">
+                  <Download className="w-4 h-4 mr-2" />
+                  Save File
+                </Button>
+              ) : downloadStatus === "error" ? (
+                <Button onClick={handleDownload} variant="outline" className="flex-1 bg-transparent">
+                  Try Again
+                </Button>
+              ) : (
+                <Button disabled className="flex-1">
+                  <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                  {downloadStatus === "idle"
+                    ? "Initializing..."
+                    : downloadStatus === "searching"
+                      ? "Searching..."
+                      : downloadStatus === "connecting"
+                        ? "Connecting..."
+                        : "Downloading..."}
+                </Button>
+              )}
+            </div>
 
-          {/* Error Alert */}
-          {error && (
-            <Alert variant="destructive">
-              <AlertCircle className="h-4 w-4" />
-              <AlertDescription>{error}</AlertDescription>
-            </Alert>
-          )}
+            {/* Instructions */}
+            <div className="bg-blue-50 rounded-lg p-4">
+              <h4 className="font-semibold text-blue-900 mb-2">How P2P Download Works:</h4>
+              <ul className="text-sm text-blue-800 space-y-1">
+                <li>• Your browser connects to other peers in the network</li>
+                <li>• Files are transferred directly between browsers</li>
+                <li>• No files are stored on our servers</li>
+                <li>• The file sharer must be online for download to work</li>
+              </ul>
+            </div>
 
-          {/* Help Text */}
-          <div className="text-xs text-gray-500 text-center space-y-1">
-            <p>Files are transferred directly between peers without server storage.</p>
-            <p>The sharing peer must be online for the download to work.</p>
-          </div>
-        </CardContent>
-      </Card>
+            {/* Technical Details */}
+            <details className="text-sm text-gray-600">
+              <summary className="cursor-pointer font-medium">Technical Details</summary>
+              <div className="mt-2 space-y-1">
+                <p>Share ID: {shareId}</p>
+                <p>Network Status: {connectionStatus}</p>
+                <p>Connected Peers: {peers.size}</p>
+                <p>WebRTC Support: {typeof RTCPeerConnection !== "undefined" ? "Yes" : "No"}</p>
+              </div>
+            </details>
+          </CardContent>
+        </Card>
+      </div>
     </div>
   )
 }
