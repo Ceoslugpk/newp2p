@@ -1,340 +1,256 @@
 "use client"
 
-import { useState, useEffect } from "react"
+import { useEffect, useState } from "react"
 import { useParams } from "next/navigation"
-import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
-import { Badge } from "@/components/ui/badge"
+import { Button } from "@/components/ui/button"
 import { Progress } from "@/components/ui/progress"
-import { useToast } from "@/hooks/use-toast"
-import { Download, FileText, Shield, Users, AlertCircle, CheckCircle, Loader2 } from "lucide-react"
+import { Alert, AlertDescription } from "@/components/ui/alert"
+import { Download, AlertCircle, CheckCircle, Loader2 } from "lucide-react"
 import { useP2PNetwork } from "@/hooks/use-p2p-network"
 
 interface FileInfo {
   name: string
   size: number
-  type: string
-  hash: string
-  lastModified: number
+  shareId: string
 }
 
 export default function DownloadPage() {
   const params = useParams()
   const shareId = params.shareId as string
+  const { networkStatus, transfers, requestFile } = useP2PNetwork()
   const [fileInfo, setFileInfo] = useState<FileInfo | null>(null)
-  const [isLoading, setIsLoading] = useState(true)
-  const [isDownloading, setIsDownloading] = useState(false)
-  const [downloadProgress, setDownloadProgress] = useState(0)
-  const [downloadedChunks, setDownloadedChunks] = useState(0)
-  const [totalChunks, setTotalChunks] = useState(0)
+  const [downloadStatus, setDownloadStatus] = useState<
+    "idle" | "searching" | "found" | "downloading" | "completed" | "failed"
+  >("idle")
   const [error, setError] = useState<string | null>(null)
-  const [downloadedData, setDownloadedData] = useState<Map<number, ArrayBuffer>>(new Map())
 
-  const { toast } = useToast()
-  const { isConnected, peerCount, downloadFile } = useP2PNetwork()
+  // Find active transfer for this share
+  const activeTransfer = transfers.find((t) => t.id.includes(shareId))
 
   useEffect(() => {
-    if (shareId && isConnected) {
-      discoverFile()
-    }
-  }, [shareId, isConnected])
-
-  const discoverFile = async () => {
-    try {
-      setIsLoading(true)
+    if (shareId && networkStatus.isOnline) {
+      setDownloadStatus("searching")
       setError(null)
 
-      // Wait for network to be ready
-      await new Promise((resolve) => setTimeout(resolve, 2000))
+      // Request the file from the network
+      requestFile(shareId)
 
-      // Check if this looks like a valid share ID
-      if (shareId && shareId.length === 16 && /^[a-f0-9]+$/.test(shareId)) {
-        // In a real P2P network, we would query peers for file metadata
-        // For now, show that we're looking for the file
-        if (peerCount === 0) {
-          setError("No peers available. Please ensure the file sharer is online and try again.")
-        } else {
-          setError("File not found in network. The file may no longer be shared or peers are offline.")
+      // Set timeout for file discovery
+      const timeout = setTimeout(() => {
+        if (downloadStatus === "searching") {
+          setDownloadStatus("failed")
+          setError("File not found in the network. The sharing peer may be offline.")
         }
-      } else {
-        setError("Invalid share link format.")
-      }
-    } catch (err) {
-      setError("Failed to discover file. Please check your connection and try again.")
-    } finally {
-      setIsLoading(false)
+      }, 30000) // 30 second timeout
+
+      return () => clearTimeout(timeout)
     }
-  }
+  }, [shareId, networkStatus.isOnline, requestFile])
 
-  const startDownload = async () => {
-    if (!fileInfo || !isConnected) return
-
-    try {
-      setIsDownloading(true)
-      setDownloadProgress(0)
-      setDownloadedChunks(0)
-      setDownloadedData(new Map())
-
-      toast({
-        title: "Download started",
-        description: `Downloading ${fileInfo.name} via P2P network`,
-      })
-
-      await downloadFile(
-        shareId,
-        (progress) => {
-          setDownloadProgress(progress)
-        },
-        (chunk, index, total) => {
-          setDownloadedData((prev) => {
-            const newMap = new Map(prev)
-            newMap.set(index, chunk)
-            return newMap
+  // Update status based on transfer progress
+  useEffect(() => {
+    if (activeTransfer) {
+      switch (activeTransfer.status) {
+        case "pending":
+          setDownloadStatus("found")
+          setFileInfo({
+            name: activeTransfer.fileName,
+            size: activeTransfer.fileSize,
+            shareId: shareId,
           })
-          setDownloadedChunks((prev) => prev + 1)
-          setTotalChunks(total)
-        },
-      )
-
-      // Reconstruct file from chunks
-      const sortedChunks = Array.from(downloadedData.entries())
-        .sort(([a], [b]) => a - b)
-        .map(([, chunk]) => chunk)
-
-      const fileData = new Uint8Array(sortedChunks.reduce((total, chunk) => total + chunk.byteLength, 0))
-
-      let offset = 0
-      for (const chunk of sortedChunks) {
-        fileData.set(new Uint8Array(chunk), offset)
-        offset += chunk.byteLength
+          break
+        case "transferring":
+          setDownloadStatus("downloading")
+          break
+        case "completed":
+          setDownloadStatus("completed")
+          break
+        case "failed":
+          setDownloadStatus("failed")
+          setError("File transfer failed. Please try again.")
+          break
       }
+    }
+  }, [activeTransfer, shareId])
 
-      // Create download link
-      const blob = new Blob([fileData], { type: fileInfo.type })
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement("a")
-      a.href = url
-      a.download = fileInfo.name
-      document.body.appendChild(a)
-      a.click()
-      document.body.removeChild(a)
-      URL.revokeObjectURL(url)
-
-      toast({
-        title: "Download completed",
-        description: `${fileInfo.name} has been downloaded successfully`,
-      })
-    } catch (err) {
-      setError("Download failed. Please try again.")
-      toast({
-        title: "Download failed",
-        description: "The download could not be completed. Please try again.",
-        variant: "destructive",
-      })
-    } finally {
-      setIsDownloading(false)
+  const handleDownload = () => {
+    if (fileInfo) {
+      requestFile(shareId)
+      setDownloadStatus("downloading")
     }
   }
 
-  const formatFileSize = (bytes: number) => {
-    const sizes = ["Bytes", "KB", "MB", "GB"]
+  const formatFileSize = (bytes: number): string => {
     if (bytes === 0) return "0 Bytes"
-    const i = Math.floor(Math.log(bytes) / Math.log(1024))
-    return Math.round((bytes / Math.pow(1024, i)) * 100) / 100 + " " + sizes[i]
+    const k = 1024
+    const sizes = ["Bytes", "KB", "MB", "GB"]
+    const i = Math.floor(Math.log(bytes) / Math.log(k))
+    return Number.parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i]
   }
 
-  if (isLoading) {
-    return (
-      <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-4">
-        <div className="max-w-2xl mx-auto pt-20">
-          <Card>
-            <CardContent className="pt-6">
-              <div className="text-center py-8">
-                <Loader2 className="w-12 h-12 mx-auto mb-4 animate-spin text-blue-500" />
-                <h3 className="text-lg font-semibold mb-2">Discovering file...</h3>
-                <p className="text-gray-600">Searching the P2P network for your file</p>
-              </div>
-            </CardContent>
-          </Card>
-        </div>
-      </div>
-    )
+  const getStatusIcon = () => {
+    switch (downloadStatus) {
+      case "searching":
+        return <Loader2 className="h-6 w-6 animate-spin text-blue-500" />
+      case "found":
+        return <Download className="h-6 w-6 text-green-500" />
+      case "downloading":
+        return <Loader2 className="h-6 w-6 animate-spin text-blue-500" />
+      case "completed":
+        return <CheckCircle className="h-6 w-6 text-green-500" />
+      case "failed":
+        return <AlertCircle className="h-6 w-6 text-red-500" />
+      default:
+        return <Download className="h-6 w-6 text-gray-500" />
+    }
   }
 
-  if (error) {
+  const getStatusMessage = () => {
+    switch (downloadStatus) {
+      case "idle":
+        return "Connecting to P2P network..."
+      case "searching":
+        return "Searching for file in the network..."
+      case "found":
+        return "File found! Ready to download."
+      case "downloading":
+        return "Downloading file via P2P..."
+      case "completed":
+        return "Download completed successfully!"
+      case "failed":
+        return "Download failed."
+      default:
+        return "Unknown status"
+    }
+  }
+
+  if (!networkStatus.isOnline) {
     return (
-      <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-4">
-        <div className="max-w-2xl mx-auto pt-20">
-          <Card>
-            <CardContent className="pt-6">
-              <div className="text-center py-8">
-                <AlertCircle className="w-12 h-12 mx-auto mb-4 text-red-500" />
-                <h3 className="text-lg font-semibold mb-2 text-red-700">File Not Found</h3>
-                <p className="text-gray-600 mb-4">{error}</p>
-                <Button onClick={discoverFile} variant="outline">
-                  Try Again
-                </Button>
-              </div>
-            </CardContent>
-          </Card>
-        </div>
+      <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 flex items-center justify-center p-4">
+        <Card className="w-full max-w-md">
+          <CardHeader className="text-center">
+            <CardTitle className="flex items-center justify-center gap-2">
+              <AlertCircle className="h-6 w-6 text-red-500" />
+              Connection Error
+            </CardTitle>
+            <CardDescription>Unable to connect to the P2P network</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <Alert>
+              <AlertCircle className="h-4 w-4" />
+              <AlertDescription>
+                Please check your internet connection and try again. The signaling server may be temporarily
+                unavailable.
+              </AlertDescription>
+            </Alert>
+          </CardContent>
+        </Card>
       </div>
     )
   }
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-4">
-      <div className="max-w-2xl mx-auto pt-20">
-        {/* Network Status */}
-        <Card className="mb-6">
-          <CardContent className="pt-6">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-4">
-                <div className="flex items-center gap-2">
-                  <div className={`w-3 h-3 rounded-full ${isConnected ? "bg-green-500" : "bg-red-500"}`} />
-                  <span className="text-sm font-medium">
-                    {isConnected ? "Connected to P2P Network" : "Connecting..."}
-                  </span>
+    <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 flex items-center justify-center p-4">
+      <Card className="w-full max-w-md">
+        <CardHeader className="text-center">
+          <CardTitle className="flex items-center justify-center gap-2">
+            {getStatusIcon()}
+            P2P File Download
+          </CardTitle>
+          <CardDescription>Share ID: {shareId}</CardDescription>
+        </CardHeader>
+
+        <CardContent className="space-y-4">
+          {/* Network Status */}
+          <div className="flex items-center justify-between text-sm">
+            <span>Network Status:</span>
+            <span
+              className={`font-medium ${networkStatus.signaling === "connected" ? "text-green-600" : "text-red-600"}`}
+            >
+              {networkStatus.signaling === "connected" ? "Connected" : "Disconnected"}
+            </span>
+          </div>
+
+          <div className="flex items-center justify-between text-sm">
+            <span>Connected Peers:</span>
+            <span className="font-medium">{networkStatus.peers.length}</span>
+          </div>
+
+          {/* File Information */}
+          {fileInfo && (
+            <div className="border rounded-lg p-4 bg-gray-50">
+              <h3 className="font-medium text-gray-900 mb-2">File Details</h3>
+              <div className="space-y-1 text-sm text-gray-600">
+                <div className="flex justify-between">
+                  <span>Name:</span>
+                  <span className="font-medium">{fileInfo.name}</span>
                 </div>
-                <div className="flex items-center gap-1 text-sm text-gray-600">
-                  <Users className="w-4 h-4" />
-                  <span>{peerCount} peers online</span>
+                <div className="flex justify-between">
+                  <span>Size:</span>
+                  <span className="font-medium">{formatFileSize(fileInfo.size)}</span>
                 </div>
-              </div>
-              <Badge variant="secondary" className="flex items-center gap-1">
-                <Shield className="w-3 h-3" />
-                TURN-enabled
-              </Badge>
-            </div>
-          </CardContent>
-        </Card>
-
-        {/* File Information */}
-        {fileInfo && (
-          <Card className="mb-6">
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2">
-                <FileText className="w-6 h-6 text-blue-500" />
-                {fileInfo.name}
-              </CardTitle>
-              <CardDescription>File available for P2P download</CardDescription>
-            </CardHeader>
-            <CardContent>
-              <div className="space-y-4">
-                <div className="grid grid-cols-2 gap-4 text-sm">
-                  <div>
-                    <span className="font-medium">File Size:</span>
-                    <p className="text-gray-600">{formatFileSize(fileInfo.size)}</p>
-                  </div>
-                  <div>
-                    <span className="font-medium">File Type:</span>
-                    <p className="text-gray-600">{fileInfo.type || "Unknown"}</p>
-                  </div>
-                  <div>
-                    <span className="font-medium">Available Peers:</span>
-                    <p className="text-gray-600 flex items-center gap-1">
-                      <Users className="w-4 h-4" />
-                      {peerCount} peers
-                    </p>
-                  </div>
-                  <div>
-                    <span className="font-medium">File Hash:</span>
-                    <p className="text-gray-600 font-mono text-xs">{fileInfo.hash.slice(0, 16)}...</p>
-                  </div>
-                </div>
-
-                {/* Download Progress */}
-                {isDownloading && (
-                  <div className="space-y-2">
-                    <div className="flex items-center justify-between text-sm">
-                      <span>Download Progress</span>
-                      <span>{Math.round(downloadProgress)}%</span>
-                    </div>
-                    <Progress value={downloadProgress} className="w-full" />
-                    <div className="flex items-center justify-between text-xs text-gray-600">
-                      <span>
-                        Chunks: {downloadedChunks}/{totalChunks}
-                      </span>
-                      <span>P2P Transfer Active</span>
-                    </div>
-                  </div>
-                )}
-
-                {/* Download Button */}
-                <Button
-                  onClick={startDownload}
-                  disabled={isDownloading || !isConnected || peerCount === 0}
-                  className="w-full"
-                  size="lg"
-                >
-                  {isDownloading ? (
-                    <>
-                      <Loader2 className="w-5 h-5 mr-2 animate-spin" />
-                      Downloading via P2P...
-                    </>
-                  ) : (
-                    <>
-                      <Download className="w-5 h-5 mr-2" />
-                      Download via P2P
-                    </>
-                  )}
-                </Button>
-
-                {/* Status Messages */}
-                {!isConnected && (
-                  <div className="flex items-center gap-2 text-sm text-yellow-700 bg-yellow-50 p-3 rounded-lg">
-                    <AlertCircle className="w-4 h-4" />
-                    <span>Connecting to P2P network...</span>
-                  </div>
-                )}
-
-                {peerCount === 0 && isConnected && (
-                  <div className="flex items-center gap-2 text-sm text-red-700 bg-red-50 p-3 rounded-lg">
-                    <AlertCircle className="w-4 h-4" />
-                    <span>No peers available. The file may no longer be shared.</span>
-                  </div>
-                )}
-              </div>
-            </CardContent>
-          </Card>
-        )}
-
-        {/* TURN Information */}
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <Shield className="w-5 h-5" />
-              P2P Transfer Technology
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
-              <div className="flex items-center gap-2">
-                <CheckCircle className="w-4 h-4 text-green-600" />
-                <span>TURN server NAT traversal</span>
-              </div>
-              <div className="flex items-center gap-2">
-                <CheckCircle className="w-4 h-4 text-green-600" />
-                <span>Direct peer-to-peer transfer</span>
-              </div>
-              <div className="flex items-center gap-2">
-                <CheckCircle className="w-4 h-4 text-green-600" />
-                <span>End-to-end encryption</span>
-              </div>
-              <div className="flex items-center gap-2">
-                <CheckCircle className="w-4 h-4 text-green-600" />
-                <span>No server storage</span>
               </div>
             </div>
-            <div className="mt-4 p-3 bg-blue-50 rounded-lg">
-              <p className="text-sm text-blue-800">
-                This application uses TURN servers to establish direct peer-to-peer connections, even through NAT and
-                firewalls. Files are transferred directly between users without being stored on any server.
-              </p>
-            </div>
-          </CardContent>
-        </Card>
-      </div>
+          )}
+
+          {/* Status Message */}
+          <div className="text-center">
+            <p className="text-sm text-gray-600 mb-4">{getStatusMessage()}</p>
+
+            {/* Progress Bar */}
+            {activeTransfer && downloadStatus === "downloading" && (
+              <div className="space-y-2">
+                <Progress value={activeTransfer.progress} className="w-full" />
+                <p className="text-xs text-gray-500">{Math.round(activeTransfer.progress)}% completed</p>
+              </div>
+            )}
+          </div>
+
+          {/* Action Button */}
+          {downloadStatus === "found" && (
+            <Button onClick={handleDownload} className="w-full" size="lg">
+              <Download className="h-4 w-4 mr-2" />
+              Download via P2P
+            </Button>
+          )}
+
+          {downloadStatus === "searching" && (
+            <Button disabled className="w-full" size="lg">
+              <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+              Searching for file...
+            </Button>
+          )}
+
+          {downloadStatus === "downloading" && (
+            <Button disabled className="w-full" size="lg">
+              <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+              Downloading...
+            </Button>
+          )}
+
+          {downloadStatus === "completed" && (
+            <Button disabled className="w-full" size="lg">
+              <CheckCircle className="h-4 w-4 mr-2" />
+              Download Completed
+            </Button>
+          )}
+
+          {/* Error Alert */}
+          {error && (
+            <Alert variant="destructive">
+              <AlertCircle className="h-4 w-4" />
+              <AlertDescription>{error}</AlertDescription>
+            </Alert>
+          )}
+
+          {/* Help Text */}
+          <div className="text-xs text-gray-500 text-center space-y-1">
+            <p>Files are transferred directly between peers without server storage.</p>
+            <p>The sharing peer must be online for the download to work.</p>
+          </div>
+        </CardContent>
+      </Card>
     </div>
   )
 }
