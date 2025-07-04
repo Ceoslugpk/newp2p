@@ -2,9 +2,8 @@ const WebSocket = require("ws")
 const fs = require("fs")
 const path = require("path")
 
-// Configuration
 const PORT = process.env.PORT || 8080
-const LOG_DIR = path.join(__dirname, "../logs")
+const LOG_DIR = path.join(__dirname, "..", "logs")
 
 // Ensure logs directory exists
 if (!fs.existsSync(LOG_DIR)) {
@@ -15,7 +14,6 @@ if (!fs.existsSync(LOG_DIR)) {
 function log(message) {
   const timestamp = new Date().toISOString()
   const logMessage = `[${timestamp}] ${message}\n`
-
   console.log(logMessage.trim())
 
   // Write to log file
@@ -28,363 +26,240 @@ const wss = new WebSocket.Server({
   path: "/ws",
 })
 
-// Store connected peers
-const peers = new Map()
+// Store active connections
+const connections = new Map()
 const rooms = new Map()
 
-log(`Signaling server starting on port ${PORT}`)
-
 wss.on("connection", (ws, req) => {
-  const clientIP = req.socket.remoteAddress
-  const peerId = generatePeerId()
+  const clientId = generateId()
+  connections.set(clientId, ws)
 
-  log(`New peer connected: ${peerId} from ${clientIP}`)
+  log(`Client ${clientId} connected from ${req.socket.remoteAddress}`)
 
-  // Store peer connection
-  peers.set(peerId, {
-    ws: ws,
-    id: peerId,
-    ip: clientIP,
-    connectedAt: new Date(),
-    rooms: new Set(),
-  })
-
-  // Send peer ID to client
-  ws.send(
-    JSON.stringify({
-      type: "peer-id",
-      peerId: peerId,
-    }),
-  )
-
-  // Handle messages
   ws.on("message", (data) => {
     try {
       const message = JSON.parse(data.toString())
-      handleMessage(peerId, message)
+      handleMessage(clientId, message)
     } catch (error) {
-      log(`Error parsing message from ${peerId}: ${error.message}`)
+      log(`Error parsing message from ${clientId}: ${error.message}`)
     }
   })
 
-  // Handle disconnection
   ws.on("close", () => {
-    log(`Peer disconnected: ${peerId}`)
+    log(`Client ${clientId} disconnected`)
+    connections.delete(clientId)
 
-    const peer = peers.get(peerId)
-    if (peer) {
-      // Leave all rooms
-      peer.rooms.forEach((roomId) => {
-        leaveRoom(peerId, roomId)
-      })
-
-      // Remove peer
-      peers.delete(peerId)
+    // Remove from all rooms
+    for (const [roomId, clients] of rooms.entries()) {
+      if (clients.has(clientId)) {
+        clients.delete(clientId)
+        if (clients.size === 0) {
+          rooms.delete(roomId)
+        } else {
+          // Notify other clients in room
+          broadcastToRoom(
+            roomId,
+            {
+              type: "peer-disconnected",
+              peerId: clientId,
+            },
+            clientId,
+          )
+        }
+      }
     }
   })
 
-  // Handle errors
   ws.on("error", (error) => {
-    log(`WebSocket error for peer ${peerId}: ${error.message}`)
+    log(`WebSocket error for client ${clientId}: ${error.message}`)
   })
+
+  // Send welcome message
+  ws.send(
+    JSON.stringify({
+      type: "connected",
+      clientId: clientId,
+    }),
+  )
 })
 
-// Generate unique peer ID
-function generatePeerId() {
-  return Math.random().toString(36).substr(2, 9)
-}
-
-// Handle incoming messages
-function handleMessage(peerId, message) {
-  const peer = peers.get(peerId)
-  if (!peer) {
-    log(`Message from unknown peer: ${peerId}`)
-    return
-  }
-
-  log(`Message from ${peerId}: ${message.type}`)
+function handleMessage(clientId, message) {
+  log(`Message from ${clientId}: ${message.type}`)
 
   switch (message.type) {
     case "join-room":
-      joinRoom(peerId, message.roomId)
+      joinRoom(clientId, message.roomId)
       break
 
     case "leave-room":
-      leaveRoom(peerId, message.roomId)
+      leaveRoom(clientId, message.roomId)
       break
 
     case "offer":
     case "answer":
     case "ice-candidate":
-      relayMessage(peerId, message)
+      relayMessage(clientId, message)
       break
 
     case "file-request":
-      handleFileRequest(peerId, message)
+      handleFileRequest(clientId, message)
       break
 
     case "file-response":
-      handleFileResponse(peerId, message)
-      break
-
-    case "ping":
-      peer.ws.send(JSON.stringify({ type: "pong" }))
+      handleFileResponse(clientId, message)
       break
 
     default:
-      log(`Unknown message type from ${peerId}: ${message.type}`)
+      log(`Unknown message type: ${message.type}`)
   }
 }
 
-// Join a room
-function joinRoom(peerId, roomId) {
-  const peer = peers.get(peerId)
-  if (!peer) return
-
-  // Create room if it doesn't exist
+function joinRoom(clientId, roomId) {
   if (!rooms.has(roomId)) {
     rooms.set(roomId, new Set())
   }
 
   const room = rooms.get(roomId)
-  room.add(peerId)
-  peer.rooms.add(roomId)
+  room.add(clientId)
 
-  log(`Peer ${peerId} joined room ${roomId}`)
+  log(`Client ${clientId} joined room ${roomId}`)
 
-  // Notify other peers in the room
-  const otherPeers = Array.from(room).filter((id) => id !== peerId)
+  // Send list of existing peers
+  const peers = Array.from(room).filter((id) => id !== clientId)
+  const ws = connections.get(clientId)
 
-  peer.ws.send(
-    JSON.stringify({
-      type: "room-joined",
-      roomId: roomId,
-      peers: otherPeers,
-    }),
-  )
-
-  // Notify other peers about new peer
-  otherPeers.forEach((otherPeerId) => {
-    const otherPeer = peers.get(otherPeerId)
-    if (otherPeer) {
-      otherPeer.ws.send(
-        JSON.stringify({
-          type: "peer-joined",
-          roomId: roomId,
-          peerId: peerId,
-        }),
-      )
-    }
-  })
-}
-
-// Leave a room
-function leaveRoom(peerId, roomId) {
-  const peer = peers.get(peerId)
-  if (!peer) return
-
-  const room = rooms.get(roomId)
-  if (room) {
-    room.delete(peerId)
-    peer.rooms.delete(roomId)
-
-    log(`Peer ${peerId} left room ${roomId}`)
+  if (ws) {
+    ws.send(
+      JSON.stringify({
+        type: "room-joined",
+        roomId: roomId,
+        peers: peers,
+      }),
+    )
 
     // Notify other peers
-    room.forEach((otherPeerId) => {
-      const otherPeer = peers.get(otherPeerId)
-      if (otherPeer) {
-        otherPeer.ws.send(
-          JSON.stringify({
-            type: "peer-left",
-            roomId: roomId,
-            peerId: peerId,
-          }),
-        )
-      }
-    })
+    broadcastToRoom(
+      roomId,
+      {
+        type: "peer-joined",
+        peerId: clientId,
+      },
+      clientId,
+    )
+  }
+}
 
-    // Remove room if empty
+function leaveRoom(clientId, roomId) {
+  if (rooms.has(roomId)) {
+    const room = rooms.get(roomId)
+    room.delete(clientId)
+
     if (room.size === 0) {
       rooms.delete(roomId)
-      log(`Room ${roomId} removed (empty)`)
+    } else {
+      broadcastToRoom(
+        roomId,
+        {
+          type: "peer-left",
+          peerId: clientId,
+        },
+        clientId,
+      )
     }
+
+    log(`Client ${clientId} left room ${roomId}`)
   }
 }
 
-// Relay message to target peer
-function relayMessage(fromPeerId, message) {
-  const targetPeer = peers.get(message.targetPeerId)
+function relayMessage(fromClientId, message) {
+  const targetId = message.targetId
+  const targetWs = connections.get(targetId)
 
-  if (targetPeer) {
-    targetPeer.ws.send(
+  if (targetWs) {
+    targetWs.send(
       JSON.stringify({
         ...message,
-        fromPeerId: fromPeerId,
+        fromId: fromClientId,
       }),
     )
-
-    log(`Relayed ${message.type} from ${fromPeerId} to ${message.targetPeerId}`)
   } else {
-    log(`Target peer not found: ${message.targetPeerId}`)
-
-    // Notify sender that target is not available
-    const senderPeer = peers.get(fromPeerId)
-    if (senderPeer) {
-      senderPeer.ws.send(
-        JSON.stringify({
-          type: "error",
-          message: "Target peer not found",
-          targetPeerId: message.targetPeerId,
-        }),
-      )
-    }
+    log(`Target client ${targetId} not found for relay`)
   }
 }
 
-// Handle file request
-function handleFileRequest(peerId, message) {
-  log(`File request from ${peerId} for share ${message.shareId}`)
+function handleFileRequest(clientId, message) {
+  log(`File request from ${clientId} for share ${message.shareId}`)
 
-  // Find peer with the requested file
-  const targetPeer = findPeerWithFile(message.shareId)
-
-  if (targetPeer) {
-    targetPeer.ws.send(
-      JSON.stringify({
-        type: "file-request",
-        shareId: message.shareId,
-        requesterPeerId: peerId,
-      }),
-    )
-
-    log(`File request forwarded to ${targetPeer.id}`)
-  } else {
-    // File not found
-    const requesterPeer = peers.get(peerId)
-    if (requesterPeer) {
-      requesterPeer.ws.send(
-        JSON.stringify({
-          type: "file-not-found",
-          shareId: message.shareId,
-        }),
-      )
-    }
-
-    log(`File not found for share ${message.shareId}`)
-  }
+  // Broadcast file request to all peers in the room
+  const roomId = message.roomId || "global"
+  broadcastToRoom(
+    roomId,
+    {
+      type: "file-request",
+      shareId: message.shareId,
+      requesterId: clientId,
+    },
+    clientId,
+  )
 }
 
-// Handle file response
-function handleFileResponse(peerId, message) {
-  const requesterPeer = peers.get(message.requesterPeerId)
+function handleFileResponse(clientId, message) {
+  log(`File response from ${clientId} for share ${message.shareId}`)
 
-  if (requesterPeer) {
-    requesterPeer.ws.send(
+  // Send response to requester
+  const requesterWs = connections.get(message.requesterId)
+  if (requesterWs) {
+    requesterWs.send(
       JSON.stringify({
         type: "file-response",
         shareId: message.shareId,
+        providerId: clientId,
         available: message.available,
-        providerPeerId: peerId,
         fileInfo: message.fileInfo,
       }),
     )
-
-    log(`File response sent to ${message.requesterPeerId}`)
   }
 }
 
-// Find peer with specific file
-function findPeerWithFile(shareId) {
-  // This is a simplified implementation
-  // In a real system, you'd maintain a registry of shared files
-  for (const [peerId, peer] of peers) {
-    // For now, we'll assume any connected peer might have the file
-    // This should be replaced with actual file registry logic
-    return peer
-  }
-  return null
-}
-
-// Health check endpoint
-wss.on("listening", () => {
-  log(`Signaling server listening on port ${PORT}`)
-
-  // Start periodic cleanup
-  setInterval(cleanupInactivePeers, 30000) // Every 30 seconds
-
-  // Start statistics logging
-  setInterval(logStatistics, 60000) // Every minute
-})
-
-// Cleanup inactive peers
-function cleanupInactivePeers() {
-  const now = new Date()
-  const timeout = 5 * 60 * 1000 // 5 minutes
-
-  for (const [peerId, peer] of peers) {
-    if (now - peer.connectedAt > timeout && peer.ws.readyState !== WebSocket.OPEN) {
-      log(`Cleaning up inactive peer: ${peerId}`)
-
-      // Leave all rooms
-      peer.rooms.forEach((roomId) => {
-        leaveRoom(peerId, roomId)
-      })
-
-      // Remove peer
-      peers.delete(peerId)
+function broadcastToRoom(roomId, message, excludeId = null) {
+  if (rooms.has(roomId)) {
+    const room = rooms.get(roomId)
+    for (const clientId of room) {
+      if (clientId !== excludeId) {
+        const ws = connections.get(clientId)
+        if (ws) {
+          ws.send(JSON.stringify(message))
+        }
+      }
     }
   }
 }
 
-// Log statistics
-function logStatistics() {
-  const stats = {
-    connectedPeers: peers.size,
-    activeRooms: rooms.size,
-    totalRoomMembers: Array.from(rooms.values()).reduce((sum, room) => sum + room.size, 0),
-  }
-
-  log(`Statistics: ${JSON.stringify(stats)}`)
+function generateId() {
+  return Math.random().toString(36).substr(2, 9)
 }
 
-// Handle server shutdown
-process.on("SIGTERM", () => {
-  log("Received SIGTERM, shutting down gracefully")
+log(`Signaling server started on port ${PORT}`)
 
-  // Close all connections
-  peers.forEach((peer, peerId) => {
-    peer.ws.close()
-  })
-
-  wss.close(() => {
-    log("Signaling server shut down")
-    process.exit(0)
-  })
+// Health check endpoint
+const http = require("http")
+const server = http.createServer((req, res) => {
+  if (req.url === "/health") {
+    res.writeHead(200, { "Content-Type": "application/json" })
+    res.end(
+      JSON.stringify({
+        status: "healthy",
+        connections: connections.size,
+        rooms: rooms.size,
+        timestamp: new Date().toISOString(),
+      }),
+    )
+  } else {
+    res.writeHead(404)
+    res.end("Not Found")
+  }
 })
 
-process.on("SIGINT", () => {
-  log("Received SIGINT, shutting down gracefully")
-
-  // Close all connections
-  peers.forEach((peer, peerId) => {
-    peer.ws.close()
-  })
-
-  wss.close(() => {
-    log("Signaling server shut down")
-    process.exit(0)
-  })
+server.listen(PORT + 1, () => {
+  log(`Health check server started on port ${PORT + 1}`)
 })
-
-// Handle uncaught exceptions
-process.on("uncaughtException", (error) => {
-  log(`Uncaught exception: ${error.message}`)
-  log(error.stack)
-})
-
-process.on("unhandledRejection", (reason, promise) => {
-  log(`Unhandled rejection at: ${promise}, reason: ${reason}`)
-})
-
-log("Signaling server initialized")

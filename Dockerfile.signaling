@@ -1,27 +1,12 @@
-# Dockerfile for the signaling server
 FROM node:18-alpine
-
 WORKDIR /app
-
-# Copy package files
 COPY package.json ./
 COPY scripts/signaling-server.js ./
-
-# Install only production dependencies
 RUN npm install ws
-
-# Create logs directory
 RUN mkdir -p logs
-
-# Create non-root user
 RUN addgroup -g 1001 -S nodejs
 RUN adduser -S signaling -u 1001
-
-# Change ownership
 RUN chown -R signaling:nodejs /app
-
 USER signaling
-
 EXPOSE 8080
-
 CMD ["node", "signaling-server.js"]
