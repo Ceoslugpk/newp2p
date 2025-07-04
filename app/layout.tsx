@@ -6,8 +6,8 @@ import "./globals.css"
 const inter = Inter({ subsets: ["latin"] })
 
 export const metadata: Metadata = {
-  title: "P2P File Share - Secure Decentralized File Sharing",
-  description: "Share files securely using peer-to-peer technology. No servers, no limits, no tracking.",
+  title: "P2P File Share",
+  description: "Decentralized file sharing application",
     generator: 'v0.dev'
 }
 
